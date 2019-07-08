@@ -54,6 +54,7 @@ node_modules
 *.egg
 AC_scripts
 Pipfile.lock
+rsmanage/build
 tests/test_book/build
 instructors.csv
 htmlcov
