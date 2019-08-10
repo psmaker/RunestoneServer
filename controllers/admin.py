@@ -432,18 +432,18 @@ def add_practice_items():
     course = db(db.courses.course_name == auth.user.course_name).select().first()
     data = json.loads(request.vars.data)
 
-    string_data = [x.encode('UTF8') for x in data]
+    # Was for Python 2.x
+    # string_data = [x.encode('UTF8') for x in data]
+    # Is for Python 3.x
+    string_data = data
 
     now = datetime.datetime.utcnow()
     now_local = now - datetime.timedelta(hours=float(session.timezoneoffset))
 
-    students = db((db.auth_user.course_name == auth.user.course_name)) \
-        .select()
-    chapters = db((db.chapters.course_id == course.base_course)) \
-        .select()
+    students = db((db.auth_user.course_name == auth.user.course_name)).select()
+    chapters = db((db.chapters.course_id == course.base_course)).select()
     for chapter in chapters:
-        subchapters = db((db.sub_chapters.chapter_id == chapter.id)) \
-            .select()
+        subchapters = db((db.sub_chapters.chapter_id == chapter.id)).select()
         for subchapter in subchapters:
             subchapterTaught = db((db.sub_chapter_taught.course_name == auth.user.course_name) &
                                (db.sub_chapter_taught.chapter_label == chapter.chapter_label) &
@@ -546,24 +546,22 @@ def admin():
             if row.user_id not in instructordict:
                 studentdict[row.user_id]= name
 
-    #Not rebuilding
-    if not request.vars.projectname or not request.vars.startdate:
-        course = db(db.courses.course_name == auth.user.course_name).select().first()
-        curr_start_date = course.term_start_date.strftime("%m/%d/%Y")
-        return dict(sectionInfo=sectionsList,startDate=date,
-                    coursename=auth.user.course_name, course_id=auth.user.course_name,
-                    instructors=instructordict, students=studentdict,
-                    curr_start_date=curr_start_date, confirm=True,
-                    build_info=my_build, master_build=master_build, my_vers=my_vers,
-                    mst_vers=mst_vers,
-                    course=sidQuery,
-                    )
+    course = db(db.courses.course_name == auth.user.course_name).select().first()
+    instructor_course_list = db( (db.course_instructor.instructor == auth.user.id) &
+                                 (db.courses.id == db.course_instructor.course) &
+                                 (db.courses.base_course == course.base_course) &
+                                 (db.courses.course_name != course.course_name)).select(db.courses.course_name, db.courses.id)
 
-    return dict(sectionInfo=sectionsList, startDate=date.isoformat(), coursename=auth.user.course_name,
-                instructors=instructordict, students=studentdict, confirm=False,
-                task_name=uuid, course_url=course_url, course_id=auth.user.course_name,
+    curr_start_date = course.term_start_date.strftime("%m/%d/%Y")
+    return dict(sectionInfo=sectionsList,startDate=date,
+                coursename=auth.user.course_name, course_id=auth.user.course_name,
+                instructors=instructordict, students=studentdict,
+                curr_start_date=curr_start_date, confirm=True,
+                build_info=my_build, master_build=master_build, my_vers=my_vers,
+                mst_vers=mst_vers,
                 course=sidQuery,
-)
+                instructor_course_list=instructor_course_list
+                )
 
 # Called in admin.js from courseStudents to populate  the list of students
 # eBookConfig.getCourseStudentsURL
@@ -594,7 +592,14 @@ def grading():
 
     for row in assignments_query:
         assignmentids[row.name] = int(row.id)
-        assignment_questions = db(db.assignment_questions.assignment_id == int(row.id)).select()
+        # Retrieve relevant info for each question, ordering them based on their
+        # order in the assignment.
+        assignment_questions = db(
+            db.assignment_questions.assignment_id == int(row.id)
+        ).select(
+            db.assignment_questions.question_id,
+            db.assignment_questions.points,
+            orderby=db.assignment_questions.sorting_priority)
         questions = []
         for q in assignment_questions:
             question_name = db(db.questions.id == q.question_id).select(db.questions.name).first().name
@@ -636,6 +641,7 @@ def grading():
                 gradeRecordingUrl = URL('assignments', 'record_grade'),
                 calcTotalsURL = URL('assignments', 'calculate_totals'),
                 setTotalURL=URL('assignments', 'record_assignment_score'),
+                sendLTIGradeURL=URL('assignments', 'send_assignment_score_via_LTI'),
                 getCourseStudentsURL = URL('admin', 'course_students'),
                 get_assignment_release_statesURL= URL('admin', 'get_assignment_release_states'),
                 course_id = auth.user.course_name,
@@ -1640,6 +1646,49 @@ def reorder_assignment_questions():
 
     return json.dumps("Reordered in DB")
 
+@auth.requires(lambda: verifyInstructorStatus(auth.user.course_name, auth.user), requires_login=True)
+def copy_assignment():
+    """
+    vars:
+      - oldassignment id or  todo (-1 for all assignments)
+      - course
+    """
+
+    if not verifyInstructorStatus(request.vars['course'], auth.user):
+        return "Error: Not Authorized"
+    else:
+        if request.vars.oldassignment == '-1':
+            assignments = db((db.assignments.course == db.courses.id) &
+                             (db.courses.course_name == request.vars['course'])).select()
+            for a in assignments:
+                print("A = {}".format(a))
+                res = _copy_one_assignment(request.vars['course'], a.assignments['id'])
+                if res != "success":
+                    break
+        else:
+            res = _copy_one_assignment(request.vars['course'], request.vars['oldassignment'])
+    return res
+
+def _copy_one_assignment(course, oldid):
+        old_course = db(db.courses.course_name == course).select().first()
+        this_course = db(db.courses.course_name == auth.user.course_name).select().first()
+        old_assignment = db(db.assignments.id == int(oldid)).select().first()
+        due_delta = old_assignment.duedate.date() - old_course.term_start_date
+        due_date = this_course.term_start_date + due_delta
+        newassign_id = db.assignments.insert(course=auth.user.course_id, name=old_assignment.name,
+            duedate=due_date, description=old_assignment.description,
+            points=old_assignment.points,
+            threshold_pct=old_assignment.threshold_pct)
+
+        old_questions = db(db.assignment_questions.assignment_id == old_assignment.id).select()
+        for q in old_questions:
+            dq = q.as_dict()
+            dq['assignment_id'] = newassign_id
+            del dq['id']
+            db.assignment_questions.insert(**dq)
+
+        return "success"
+
 
 @auth.requires(lambda: verifyInstructorStatus(auth.user.course_name, auth.user), requires_login=True)
 def courselog():
@@ -1647,13 +1696,12 @@ def courselog():
     course = auth.user.course_name
 
     data = pd.read_sql_query("""
-    select sid, useinfo.timestamp, event, div_id, chapter, subchapter
+    select sid, useinfo.timestamp, event, act, div_id, chapter, subchapter
     from useinfo left outer join questions on div_id = name and questions.base_course = '{}'
-    where course_id = 'fopp'
+    where course_id = '{}'
     order by useinfo.id
     """.format(thecourse.base_course, course), settings.database_uri)
     data = data[~data.sid.str.contains('@')]
-
 
     response.headers['Content-Type']='application/vnd.ms-excel'
     response.headers['Content-Disposition']= 'attachment; filename=data_for_{}.csv'.format(auth.user.course_name)

@@ -15,6 +15,7 @@
 from textwrap import dedent
 import json
 from threading import Thread
+import datetime
 
 # Third-party imports
 # -------------------
@@ -458,7 +459,7 @@ def test_dynamic_book_routing_2(test_client, test_user_1):
     test_client.logout()
     # Test for a book that doesn't require a login. First, change the book to not require a login.
     db = test_user_1.runestone_db_tools.db
-    db(db.courses.id == test_user_1.course.course_id).update(login_required=False)
+    db(db.courses.course_name == test_user_1.course.base_course).update(login_required=False)
     db.commit()
 
     dbr_tester(test_client, test_user_1, False)
@@ -482,33 +483,29 @@ def dbr_tester(test_client, test_user_1, is_logged_in):
     # Attempt to access files outside a course.
     validate('books/published/{}/../conf.py'.format(base_course),
              expected_status=404)
-    # Attempt to access a course we're not registered for.
-    if is_logged_in:
-        runestone_db_tools = test_user_1.runestone_db_tools
-        child_course = runestone_db_tools.create_course('child_course_1', base_course=test_user_1.course.base_course)
-        validate('books/published/{}/index.html'.format(child_course.course_name), [
-            # TODO: this flashed message doesn't appear. ???
-            #'Sorry you are not registered for this course.',
-            'Choose your course',
-        ])
+    # Attempt to access a course we're not registered for. TODO: Need to create another base course for this to work.
+    ##if is_logged_in:
+    ##    #validate('books/published/{}/index.html'.format(base_course), [
+    ##        'Sorry you are not registered for this course.'
+    ##    ])
 
     # A valid page. Check the book config as well.
     validate('books/published/{}/index.html'.format(base_course), [
         'The red car drove away.',
-        "eBookConfig.course = '{}';".format(base_course),
+        "eBookConfig.course = '{}';".format(test_user_1.course.course_name if is_logged_in else base_course),
         "eBookConfig.basecourse = '{}';".format(base_course),
     ])
     # Drafts shouldn't be accessible by students.
     validate('books/draft/{}/index.html'.format(base_course),
              'Insufficient privileges' if is_logged_in else 'Username')
 
-    # Check routing in a child book.
+    # Check routing in a base course.
     if is_logged_in:
-        test_user_1.update_profile(course_name=child_course.course_name,
+        test_user_1.update_profile(course_name=test_user_1.course.base_course,
                                    is_free=True)
         validate('books/published/{}/index.html'.format(base_course), [
             'The red car drove away.',
-            "eBookConfig.course = '{}';".format(child_course.course_name),
+            "eBookConfig.course = '{}';".format(base_course),
             "eBookConfig.basecourse = '{}';".format(base_course),
         ])
 
@@ -526,7 +523,7 @@ def test_assignments(test_client, runestone_db_tools, test_user):
     name_1 = 'test_assignment_1'
     name_2 = 'test_assignment_2'
     name_3 = 'test_assignment_3'
-    
+
     # Create an assignment -- using createAssignment
     test_client.post('admin/createAssignment',
         data=dict(name=name_1))
@@ -550,7 +547,7 @@ def test_assignments(test_client, runestone_db_tools, test_user):
         (db.assignments.course == test_instructor_1.course.course_id)
     ).select().first()
     assert assign2
-    
+
     test_client.post('admin/renameAssignment',
                      data=dict(name=name_3,original=assign2.id))
     assert db(db.assignments.name == name_3).select().first()
@@ -560,15 +557,112 @@ def test_assignments(test_client, runestone_db_tools, test_user):
     test_client.post('admin/renameAssignment',
                      data=dict(name=name_3,original=assign1.id))
     assert "EXISTS" in test_client.text
-    
+
     # Delete an assignment -- using removeassignment
     test_client.post('admin/removeassign', data=dict(assignid=assign1.id))
     assert not db(db.assignments.name == name_1).select().first()
     test_client.post('admin/removeassign', data=dict(assignid=assign2.id))
     assert not db(db.assignments.name == name_3).select().first()
-    
+
     test_client.post('admin/removeassign', data=dict(assignid=9999999))
     assert "Error" in test_client.text
+
+
+def test_instructor_practice_admin(test_client, runestone_db_tools, test_user):
+    course_4 = runestone_db_tools.create_course('test_course_1')
+    test_student_1 = test_user('test_student_1', 'password_1', course_4)
+    test_student_1.logout()
+    test_instructor_1 = test_user('test_instructor_1', 'password_1', course_4)
+    test_instructor_1.make_instructor()
+    test_instructor_1.login()
+    db = runestone_db_tools.db
+    
+    course_start_date = datetime.datetime.strptime(course_4.term_start_date, '%Y-%m-%d').date()
+
+    today = datetime.datetime.today()
+    start_date = course_start_date + datetime.timedelta(days=13)
+    end_date = datetime.datetime.today().date() + datetime.timedelta(days=30)
+    max_practice_days = 40
+    max_practice_questions = 400
+    day_points = 1
+    question_points = 0.2
+    questions_to_complete_day = 5
+    graded = 0
+
+    # Test the practice tool settings for the course.
+    flashcard_creation_method = 2
+    test_client.post('admin/practice',
+        data = {"StartDate": start_date,
+                "EndDate": end_date,
+                "graded": graded,
+                'maxPracticeDays': max_practice_days,
+                'maxPracticeQuestions': max_practice_questions,
+                'pointsPerDay': day_points,
+                'pointsPerQuestion': question_points,
+                'questionsPerDay': questions_to_complete_day,
+                'flashcardsCreationType': 2,
+                'question_points': question_points})
+
+    practice_settings_1 = db(
+        (db.course_practice.auth_user_id == test_instructor_1.user_id) &
+        (db.course_practice.course_name == course_4.course_name) &
+        (db.course_practice.start_date == start_date) &
+        (db.course_practice.end_date == end_date) &
+        (db.course_practice.flashcard_creation_method == flashcard_creation_method) &
+        (db.course_practice.graded == graded)
+        ).select().first()
+    assert practice_settings_1
+    if practice_settings_1.spacing == 1:
+        assert practice_settings_1.max_practice_days == max_practice_days
+        assert practice_settings_1.day_points == day_points
+        assert practice_settings_1.questions_to_complete_day == questions_to_complete_day
+    else:
+        assert practice_settings_1.max_practice_questions == max_practice_questions
+        assert practice_settings_1.question_points == question_points
+
+    # Test instructor adding a subchapter to the practice tool for students.
+
+    # I need to call set_tz_offset to set timezoneoffset in the session.
+    test_client.post('ajax/set_tz_offset',
+        data = { 'timezoneoffset': 0 })
+    
+    # The reason I'm manually stringifying the list value is that test_client.post does something strange with compound objects instead of passing them to json.dumps.
+    test_client.post('admin/add_practice_items',
+        data = { 'data': '["Test chapter 1/Subchapter B"]' })
+
+
+    practice_settings_1 = db(
+        (db.user_topic_practice.user_id == test_student_1.user_id) &
+        (db.user_topic_practice.course_name == course_4.course_name) &
+        (db.user_topic_practice.chapter_label == "test_chapter_1") &
+        (db.user_topic_practice.sub_chapter_label == "subchapter_b")
+        ).select().first()
+    assert practice_settings_1
+
+    # Testing whether a student can answer a practice question.
+    # test_client.logout()
+    # test_student_1.login()
+
+    # ts = datetime.datetime.utcnow()
+    # ts -= datetime.timedelta(microseconds=ts.microsecond)
+
+    # test_client.post('ajax/hsblog',
+    #     data = {'event': 'mChoice',
+    #             'act': 'answer:1:correct',
+    #             'answer': 1,
+    #             'correct': 'T',
+    #             'div_id': 'subc_b_1',
+    #             'course': course_4.course_name,
+    #             'timezoneoffset': 0})
+
+    # mchoice_answers_1 = db(
+    #     (db.mchoice_answers.sid == test_student_1.user_id) &
+    #     (db.mchoice_answers.course_name == course_4.course_name) &
+    #     (db.mchoice_answers.correct == "test_chapter_1") &
+    #     (db.mchoice_answers.sub_chapter_label == "subchapter_b")
+    #     ).select().first()
+    # assert practice_settings_1
+    # db.mchoice_answers.insert(sid=sid,timestamp=ts, div_id=div_id, answer=answer, correct=correct, course_name=course)
 
 
 def test_deleteaccount(test_client, runestone_db_tools, test_user):
@@ -593,11 +687,11 @@ def test_pageprogress(test_client, runestone_db_tools, test_user_1):
     test_user_1.login()
     test_user_1.hsblog(event="mChoice",
             act="answer:1:correct",answer="1",correct="T",div_id="subc_b_1",
-            course="test_course_1")
+            course=test_user_1.course.course_name)
     # Since the user has answered the question the count for subc_b_1 should be 1
     # cannot test the totals on the client without javascript but that is covered in the
     # selenium tests on the components side.
-    test_user_1.test_client.validate('books/published/test_course_1/test_chapter_1/subchapter_b.html',
+    test_user_1.test_client.validate('books/published/{}/test_chapter_1/subchapter_b.html'.format(test_user_1.course.base_course),
         '"subc_b_1": 1')
     assert '"LearningZone_poll": 0' in test_user_1.test_client.text
     assert '"subc_b_fitb": 0' in test_user_1.test_client.text

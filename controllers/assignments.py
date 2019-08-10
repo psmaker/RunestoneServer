@@ -329,54 +329,129 @@ def record_assignment_score():
             manual_total=True
         )
 
+def _calculate_totals(sid=None, student_rownum=None, assignment_name = None, assignment_id = None):
+    if assignment_id:
+        assignment = db(
+            (db.assignments.id == assignment_id) & (db.assignments.course == auth.user.course_id)).select().first()
+    else:
+        assignment = db(
+            (db.assignments.name == assignment_name) & (db.assignments.course == auth.user.course_id)).select().first()
+    if assignment:
+        return do_calculate_totals(assignment, auth.user.course_id, auth.user.course_name, sid, student_rownum, db, settings)
+    else:
+        return {'success': False, 'message': "Select an assignment before trying to calculate totals."}
 
 @auth.requires(lambda: verifyInstructorStatus(auth.user.course_name, auth.user), requires_login=True)
 def calculate_totals():
     assignment_name = request.vars.assignment
     sid = request.vars.get('sid', None)
-    assignment = db(
-        (db.assignments.name == assignment_name) & (db.assignments.course == auth.user.course_id)).select().first()
-    if assignment:
-        return json.dumps(
-            do_calculate_totals(assignment, auth.user.course_id, auth.user.course_name, sid, db, settings))
+    return json.dumps(_calculate_totals(sid=sid, assignment_name=assignment_name))
+
+def _autograde(sid=None, student_rownum=None, question_name=None, enforce_deadline=False, assignment_name=None, assignment_id=None, timezoneoffset=None):
+    if assignment_id:
+        assignment = db(
+            (db.assignments.id == assignment_id) & (db.assignments.course == auth.user.course_id)).select().first()
     else:
-        return json.dumps({'success': False, 'message': "Select an assignment before trying to calculate totals."})
+        assignment = db(
+            (db.assignments.name == assignment_name) & (db.assignments.course == auth.user.course_id)).select().first()
+    if assignment:
+        count = do_autograde(assignment, auth.user.course_id, auth.user.course_name, sid, student_rownum, question_name,
+                             enforce_deadline, timezoneoffset, db, settings)
+        return {'success': True, 'message': "autograded {} items".format(count), 'count':count}
+    else:
+        return {'success': False, 'message': "Select an assignment before trying to autograde."}
+
+
+def _get_assignment(assignment_id):
+    return db(db.assignments.id == assignment_id).select().first()
+
+def _try_to_send_lti_grade(student_row_num, assignment_id):
+    # try to send lti grades
+    assignment = _get_assignment(assignment_id)
+    if not assignment:
+        session.flash = "Failed to find assignment object for assignment {}".format(assignment_id)
+        return False
+    else:
+        grade = db(
+            (db.grades.auth_user == student_row_num) &
+            (db.grades.assignment == assignment_id)).select().first()
+        if not grade:
+            session.flash = "Failed to find grade object for user {} and assignment {}".format(auth.user.id,
+                                                                                               assignment_id)
+            return False
+        else:
+            lti_record = _get_lti_record(session.oauth_consumer_key)
+            if (not lti_record) or (not grade.lis_result_sourcedid) or (not grade.lis_outcome_url):
+                session.flash = "Failed to send grade back to LMS (Coursera, Canvas, Blackboard...), probably because the student accessed this assignment directly rather than using a link from the LMS, or because there is an error in the assignment link in the LMS. Please report this error."
+                return False
+            else:
+                # really sending
+                # print("send_lti_grade({}, {}, {}, {}, {}, {}".format(assignment.points, grade.score, lti_record.consumer, lti_record.secret, grade.lis_outcome_url, grade.lis_result_sourcedid))
+                send_lti_grade(assignment.points,
+                               score=grade.score,
+                               consumer=lti_record.consumer,
+                               secret=lti_record.secret,
+                               outcome_url=grade.lis_outcome_url,
+                               result_sourcedid=grade.lis_result_sourcedid)
+                return True
 
 @auth.requires_login()
 def student_autograde():
     """
     This is a safe endpoint that students can call from the assignment page
-    to get a preliminary grade on their assignment.
+    to get a preliminary grade on their assignment. If in coursera_mode,
+    the total for the assignment is calculated and stored in the db, and
+    sent via LTI (if LTI is configured).
     """
     assignment_id = request.vars.assignment_id
     timezoneoffset = session.timezoneoffset if 'timezoneoffset' in session else None
-    assignment = db(db.assignments.id == assignment_id).select().first()
-    if assignment:
-        count = do_autograde(assignment, auth.user.course_id, auth.user.course_name,
-            auth.user.username, None, 'false', timezoneoffset, db, settings)
-        return json.dumps({'message': "autograded {} items".format(count)})
+
+
+    res = _autograde(student_rownum=auth.user.id,
+                     assignment_id=assignment_id,
+                     timezoneoffset=timezoneoffset)
+
+    if not res['success']:
+        session.flash = "Failed to autograde questions for user id {} for assignment {}".format(auth.user.id, assignment_id)
+        res = {'success':False}
     else:
-        return json.dumps({'success': False, 'message': "Could not find this assignment -- This should not happen"})
+        if settings.coursera_mode:
+            res2 = _calculate_totals(student_rownum=auth.user.id, assignment_id=assignment_id)
+            if not res2['success']:
+                session.flash = "Failed to compute totals for user id {} for assignment {}".format(auth.user.id, assignment_id)
+                res = {'success':False}
+            else:
+                _try_to_send_lti_grade(auth.user.id, assignment_id)
+    return json.dumps(res)
 
 
 @auth.requires(lambda: verifyInstructorStatus(auth.user.course_name, auth.user), requires_login=True)
 def autograde():
     ### This endpoint is hit to autograde one or all students or questions for an assignment
-
     sid = request.vars.get('sid', None)
     question_name = request.vars.get('question', None)
     enforce_deadline = request.vars.get('enforceDeadline', None)
     assignment_name = request.vars.assignment
     timezoneoffset = session.timezoneoffset if 'timezoneoffset' in session else None
 
+    return json.dumps(_autograde(sid=sid,
+                                 question_name=question_name,
+                                 enforce_deadline=enforce_deadline,
+                                 assignment_name=assignment_name,
+                                 timezoneoffset=timezoneoffset))
+
+@auth.requires(lambda: verifyInstructorStatus(auth.user.course_name, auth.user), requires_login=True)
+def send_assignment_score_via_LTI():
+
+    assignment_name = request.vars.assignment
+    sid = request.vars.get('sid', None)
     assignment = db(
         (db.assignments.name == assignment_name) & (db.assignments.course == auth.user.course_id)).select().first()
-    if assignment:
-        count = do_autograde(assignment, auth.user.course_id, auth.user.course_name, sid, question_name,
-                             enforce_deadline, timezoneoffset, db, settings)
-        return json.dumps({'message': "autograded {} items".format(count)})
-    else:
-        return json.dumps({'success': False, 'message': "Select an assignment before trying to autograde."})
+    student_row = db((db.auth_user.username == sid)).select(db.auth_user.id).first()
+    _try_to_send_lti_grade(student_row.id, assignment.id)
+    return json.dumps({'success': True })
+
+
 
 @auth.requires(lambda: verifyInstructorStatus(auth.user.course_name, auth.user), requires_login=True)
 def record_grade():
@@ -637,6 +712,8 @@ def doAssignment():
                 readings=readings,
                 questions_score=questions_score,
                 readings_score=readings_score,
+                # gradeRecordingUrl=URL('assignments', 'record_grade'),
+                # calcTotalsURL=URL('assignments', 'calculate_totals'),
                 student_id=auth.user.username,
                 released=assignment['released'])
 
@@ -759,7 +836,7 @@ def practice():
                                                      float(session.timezoneoffset) if 'timezoneoffset' in session else 0)
 
     if message1 != "":
-        session.flash = message1 + " " + message2
+        # session.flash = message1 + " " + message2
         return redirect(URL('practiceNotStartedYet',
                             vars=dict(message1=message1,
                                       message2=message2)))
@@ -771,7 +848,7 @@ def practice():
                         (db.user_topic_practice.user_id == auth.user.id) &
                         (db.user_topic_practice.chapter_label == db.chapters.chapter_label) &
                         (db.user_topic_practice.sub_chapter_label == db.sub_chapters.sub_chapter_label) &
-                        (db.chapters.course_id == auth.user.course_name) &
+                        (db.chapters.course_id == course.base_course) &
                         (db.sub_chapters.chapter_id == db.chapters.id)) \
             .select(db.chapters.chapter_name,
                     db.sub_chapters.sub_chapter_name,
@@ -804,20 +881,31 @@ def practice():
         elif f_card["mastery_percent"] >= 25:
             f_card["mastery_color"] = "warning"
 
-    # If the student has any flashcards to practice and has not practiced enough to get their points for today or they
-    # have intrinsic motivation to practice beyond what they are expected to do.
-    if available_flashcards_num > 0 and (practiced_today_count != questions_to_complete_day or
-                                            request.vars.willing_to_continue or
-                                            spacing == 0):
+    # If an instructor removes the practice flag from a question in the middle of the semester
+    # and students are in the middle of practicing it, the following code makes sure the practice tool does not crash.
+    questions = []
+    if len(presentable_flashcards) > 0:
         # Present the first one.
         flashcard = presentable_flashcards[0]
         # Get eligible questions.
         questions = _get_qualified_questions(course.base_course,
                                              flashcard.chapter_label,
                                              flashcard.sub_chapter_label)
+    # If the student has any flashcards to practice and has not practiced enough to get their points for today or they
+    # have intrinsic motivation to practice beyond what they are expected to do.
+    if (available_flashcards_num > 0 and 
+        len(questions) > 0 and
+        (practiced_today_count != questions_to_complete_day or
+            request.vars.willing_to_continue or
+            spacing == 0)):
         # Find index of the last question asked.
         question_names = [q.name for q in questions]
-        qIndex = question_names.index(flashcard.question_name)
+
+        try:
+            qIndex = question_names.index(flashcard.question_name)
+        except:
+            qIndex = 0
+
         # present the next one in the list after the last one that was asked
         question = questions[(qIndex + 1) % len(questions)]
 
@@ -858,15 +946,15 @@ def practice():
                 course_name=auth.user.course_name,
                 practice_completion_date=now_local.date()
             )
+            practice_completion_count = _get_practice_completion(auth.user.id,
+                                                                    auth.user.course_name,
+                                                                    spacing)
             if practice_graded == 1:
                 # send practice grade via lti, if setup for that
                 lti_record = _get_lti_record(session.oauth_consumer_key)
                 practice_grade = _get_student_practice_grade(auth.user.id, auth.user.course_name)
                 course_settings = _get_course_practice_record(auth.user.course_name)
 
-                practice_completion_count = _get_practice_completion(auth.user.id,
-                                                                     auth.user.course_name,
-                                                                     spacing)
                 if spacing == 1:
                     total_possible_points = day_points * max_days
                     points_received = day_points * practice_completion_count
